@@ -712,7 +712,7 @@ async function doFileEmail() {
   fileBtn.textContent = 'Filing...';
 
   showProgress([
-    { id: 'fetch', label: 'Fetching email content from Exchange', status: 'active' },
+    { id: 'fetch', label: 'Fetching email content from Microsoft Graph', status: 'active' },
     { id: 'folder', label: 'Preparing destination folder', status: 'pending' },
     { id: 'upload', label: 'Uploading .eml file to SharePoint', status: 'pending' },
     { id: 'meta', label: 'Tagging with metadata', status: 'pending' },
@@ -812,22 +812,38 @@ function saveFiledMarkers(info) {
   });
 }
 
-// Get the email as MIME using EWS / REST
+// Get the email as MIME using Microsoft Graph
+// Note: Microsoft began disabling legacy Exchange tokens globally in Feb 2025,
+// which broke Office.context.mailbox.getCallbackTokenAsync({ isRest: true }).
+// We now use the Graph access token (already acquired via MSAL) to fetch the MIME content
+// from https://graph.microsoft.com/v1.0/me/messages/{id}/$value
 function getEmailMime() {
-  return new Promise((resolve, reject) => {
-    // Prefer the modern REST API via getCallbackTokenAsync (works in OWA, new Outlook, classic)
-    Office.context.mailbox.getCallbackTokenAsync({ isRest: true }, tokenResult => {
-      if (tokenResult.status !== Office.AsyncResultStatus.Succeeded) {
-        return reject(new Error('Failed to acquire Exchange token: ' + tokenResult.error.message));
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Ensure we have a fresh Graph access token (the one acquired at sign-in might be stale)
+      const token = await getToken();
+
+      // The Office itemId is in EWS format; Graph needs its REST/Graph-compatible form.
+      // convertToRestId still works for the ID translation even though the REST endpoint itself is deprecated.
+      let graphId;
+      try {
+        graphId = Office.context.mailbox.convertToRestId(currentItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+      } catch (e) {
+        // In newer Outlook builds the itemId is already in REST format
+        graphId = currentItem.itemId;
       }
-      const restToken = tokenResult.value;
-      const restId = Office.context.mailbox.convertToRestId(currentItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
-      const restUrl = Office.context.mailbox.restUrl + '/v2.0/me/messages/' + restId + '/$value';
-      fetch(restUrl, { headers: { 'Authorization': 'Bearer ' + restToken } })
-        .then(r => { if (!r.ok) throw new Error('EWS HTTP ' + r.status); return r.blob(); })
-        .then(blob => resolve(blob))
-        .catch(reject);
-    });
+
+      const url = 'https://graph.microsoft.com/v1.0/me/messages/' + graphId + '/$value';
+      const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+      if (!r.ok) {
+        const errText = await r.text().catch(() => '');
+        throw new Error('Graph ' + r.status + (errText ? ': ' + errText.slice(0, 200) : ''));
+      }
+      const blob = await r.blob();
+      resolve(blob);
+    } catch (e) {
+      reject(new Error('Failed to fetch email from Microsoft Graph: ' + (e.message || e)));
+    }
   });
 }
 
