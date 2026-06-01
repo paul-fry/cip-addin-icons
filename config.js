@@ -5,8 +5,8 @@
 
 window.CIP_CONFIG = {
   // ----- Azure AD app registration (Setup Guide section 1) -----
-  clientId:   "YOUR-AZURE-AD-CLIENT-ID-HERE",
-  tenantId:   "YOUR-AZURE-AD-TENANT-ID-HERE",
+  clientId:   "56a3b894-c4be-44fd-8544-56930071a0ee",
+  tenantId:   "7b0510a2-88be-4fdb-91fa-e3e3d7630786",
 
   // ----- Microsoft Graph scopes -----
   // For read-mode filing alone: User.Read, Sites.ReadWrite.All, Files.ReadWrite.All
