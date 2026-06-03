@@ -19,6 +19,11 @@ let selectedLib = null;
 let recentlyFiled = [];
 let pendingSendInfo = null;  // populated after Send completes, signals "show send banner"
 
+// ----- Multi-select state -----
+let multiSelectSupported = false;   // true if Mailbox requirement set 1.13+ is available
+let selectedItems = [];             // populated when more than one message is selected in read mode
+let batchInProgress = false;        // suppress duplicate batch runs
+
 const RECENT_KEY = 'cip-file-email-recent';
 
 // ============================================================
@@ -35,8 +40,65 @@ Office.onReady(info => {
       populateEmailPreview();
     }
     initAuth();
+    // Subscribe to multi-select events on hosts that support requirement set 1.13+
+    initMultiSelect();
   }
 });
+
+// Detect requirement-set 1.13 multi-select support, subscribe to selection
+// changes, and refresh button state on every change. Safe no-op on older
+// hosts (Mailbox < 1.13) which simply lack getSelectedItemsAsync.
+function initMultiSelect() {
+  try {
+    if (mode !== 'read') return;
+    const mbox = Office.context.mailbox;
+    if (!mbox || typeof mbox.getSelectedItemsAsync !== 'function') return;
+    multiSelectSupported = true;
+
+    // Initial selection state (covers the case where the add-in opens with
+    // multiple messages already selected).
+    refreshSelectedItems();
+
+    // Subscribe to changes so the button label and email-preview area
+    // stay in sync as the user adds/removes messages from the selection.
+    if (Office.EventType && Office.EventType.SelectedItemsChanged) {
+      try {
+        mbox.addHandlerAsync(Office.EventType.SelectedItemsChanged, () => refreshSelectedItems());
+      } catch (e) { /* host doesn't support this event - silently ignore */ }
+    }
+  } catch (e) {
+    // Anything goes wrong, fall back to single-item behaviour
+    multiSelectSupported = false;
+  }
+}
+
+function refreshSelectedItems() {
+  if (!multiSelectSupported) return;
+  Office.context.mailbox.getSelectedItemsAsync(result => {
+    if (result.status !== Office.AsyncResultStatus.Succeeded) {
+      selectedItems = [];
+      updatePrimaryButtonLabel();
+      return;
+    }
+    selectedItems = result.value || [];
+    // When more than one message is selected, currentItem is null on most hosts.
+    // Repaint the email preview area (will show "N messages selected" banner).
+    if (mode === 'read') populateEmailPreview();
+    updatePrimaryButtonLabel();
+  });
+}
+
+function updatePrimaryButtonLabel() {
+  if (mode !== 'read') return;
+  const btn = document.getElementById('file-btn');
+  if (!btn) return;
+  const count = selectedItems.length;
+  if (count > 1) {
+    btn.textContent = `File ${count} selected emails`;
+  } else {
+    btn.textContent = 'File to SharePoint';
+  }
+}
 
 function detectMode() {
   // Item types: itemType is 'message' for both; we distinguish by whether `to` is an array
@@ -160,7 +222,40 @@ async function getToken() {
 // Email preview + filed-state check
 // ============================================================
 function populateEmailPreview() {
-  if (!currentItem) return;
+  const previewEl = document.getElementById('email-preview');
+  if (!previewEl) return;
+
+  // Multi-select state: show a "N messages selected" banner instead of single-message detail
+  if (multiSelectSupported && selectedItems.length > 1) {
+    const subjects = selectedItems.slice(0, 3).map(it => escapeHtml(it.subject || '(no subject)'));
+    const more = selectedItems.length > 3 ? ` <span class="batch-more">+ ${selectedItems.length - 3} more</span>` : '';
+    previewEl.classList.add('batch-mode');
+    previewEl.innerHTML =
+      `<div class="batch-banner">
+         <div class="batch-count">${selectedItems.length} messages selected</div>
+         <div class="batch-list">${subjects.map(s => `<div class="batch-row">• ${s}</div>`).join('')}${more}</div>
+         <div class="batch-hint">Destination and tags below will be applied to every selected message. Each is filed independently — one failure won't stop the rest.</div>
+       </div>`;
+    // The filed-state banner doesn't apply across a batch; hide if showing.
+    hideFiledBanner();
+    return;
+  }
+
+  // Single-item path (existing behaviour) — only run if we actually have an item
+  previewEl.classList.remove('batch-mode');
+  if (!currentItem) {
+    previewEl.innerHTML = '<div class="meta-row" style="color:var(--text-muted);">No email selected.</div>';
+    return;
+  }
+  // Restore the original markup if it was replaced by the batch banner on a previous render
+  if (!document.getElementById('email-subject')) {
+    previewEl.innerHTML =
+      `<div class="subject" id="email-subject">Loading email...</div>
+       <div class="meta-row"><strong>From:</strong> <span id="email-from">--</span></div>
+       <div class="meta-row"><strong>To:</strong> <span id="email-to">--</span></div>
+       <div class="meta-row"><strong>Date:</strong> <span id="email-date">--</span></div>
+       <div class="meta-row with-attach" id="email-attach-row" style="display:none;">📎 <span id="email-attach-count">0</span> attachment(s)</div>`;
+  }
   document.getElementById('email-subject').textContent = currentItem.subject || '(no subject)';
   const fromVal = currentItem.from ? `${currentItem.from.displayName || currentItem.from.emailAddress} <${currentItem.from.emailAddress}>` : '-';
   document.getElementById('email-from').textContent = fromVal;
@@ -424,6 +519,8 @@ function selectLibrary(libId) {
 function primaryAction() {
   if (mode === 'compose') {
     saveComposeSettings();
+  } else if (multiSelectSupported && selectedItems.length > 1) {
+    fileSelectedItems();
   } else {
     fileEmail();
   }
@@ -817,20 +914,25 @@ function saveFiledMarkers(info) {
 // which broke Office.context.mailbox.getCallbackTokenAsync({ isRest: true }).
 // We now use the Graph access token (already acquired via MSAL) to fetch the MIME content
 // from https://graph.microsoft.com/v1.0/me/messages/{id}/$value
-function getEmailMime() {
+//
+// graphIdArg: optional. When provided (e.g. from the multi-select batch loop) it's used
+// directly. When omitted, falls back to the currently-bound mail item's id.
+function getEmailMime(graphIdArg) {
   return new Promise(async (resolve, reject) => {
     try {
       // Ensure we have a fresh Graph access token (the one acquired at sign-in might be stale)
       const token = await getToken();
 
-      // The Office itemId is in EWS format; Graph needs its REST/Graph-compatible form.
-      // convertToRestId still works for the ID translation even though the REST endpoint itself is deprecated.
-      let graphId;
-      try {
-        graphId = Office.context.mailbox.convertToRestId(currentItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
-      } catch (e) {
-        // In newer Outlook builds the itemId is already in REST format
-        graphId = currentItem.itemId;
+      let graphId = graphIdArg;
+      if (!graphId) {
+        // The Office itemId is in EWS format; Graph needs its REST/Graph-compatible form.
+        // convertToRestId still works for the ID translation even though the REST endpoint itself is deprecated.
+        try {
+          graphId = Office.context.mailbox.convertToRestId(currentItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+        } catch (e) {
+          // In newer Outlook builds the itemId is already in REST format
+          graphId = currentItem.itemId;
+        }
       }
 
       const url = 'https://graph.microsoft.com/v1.0/me/messages/' + graphId + '/$value';
@@ -977,6 +1079,233 @@ async function setMetadata(driveItem) {
   } catch (e) {
     // If specific fields don't exist on the library, retry without them - prefer logging a warning
     console.warn('Some metadata fields could not be set (library schema may differ from recommended):', e.message);
+  }
+}
+
+// ============================================================
+// MULTI-SELECT BATCH FILING
+// ============================================================
+// Uses Office.context.mailbox.getSelectedItemsAsync (Mailbox requirement set 1.13+)
+// to file every currently-selected message in one batch. Destination + tags are
+// chosen once and applied to all. Each message is filed independently so a single
+// failure won't abort the rest.
+//
+// Constraints we inherit from Office.js:
+//   - Max 100 messages per activation.
+//   - Selection must be within a single Exchange mailbox folder (unless Conversations view is on).
+//   - Reading Pane must be enabled.
+//
+// Limitation: when multiple messages are selected, Office.context.mailbox.item is null,
+// so we cannot write the per-message custom-property markers (cip_filed, etc.) for
+// items that aren't the currently-bound item. The SharePoint record (the .eml + metadata
+// columns) is the durable filing record; the in-Outlook "filed" banner won't appear on
+// batch-filed messages until they're individually opened. That's a worthwhile follow-up.
+// ============================================================
+
+async function fileSelectedItems() {
+  if (batchInProgress) return;
+  if (!selectedItems || selectedItems.length === 0) {
+    toast('No messages selected', 'error');
+    return;
+  }
+  if (!selectedSite || !selectedLib) {
+    toast('Pick a SharePoint site and library first', 'error');
+    return;
+  }
+
+  batchInProgress = true;
+  const fileBtn = document.getElementById('file-btn');
+  fileBtn.disabled = true;
+
+  const total = selectedItems.length;
+  const results = [];
+
+  // Resolve the destination folder once (created on first call, no-op thereafter)
+  let folderPath = '';
+  try {
+    const folder = expandFolderTemplate(document.getElementById('f-folder').value);
+    folderPath = folder ? await ensureFolder(folder) : '';
+  } catch (e) {
+    showResult({ success: false, error: 'Could not prepare destination folder: ' + e.message });
+    batchInProgress = false;
+    fileBtn.disabled = false;
+    updatePrimaryButtonLabel();
+    return;
+  }
+
+  // Pull the shared tag values from the form once - applied to every item
+  const sharedTags = {
+    client: document.getElementById('f-client').value.trim(),
+    project: document.getElementById('f-project').value.trim(),
+    category: document.getElementById('f-category').value,
+    notes: document.getElementById('f-notes').value.trim()
+  };
+
+  for (let i = 0; i < total; i++) {
+    const it = selectedItems[i];
+    showBatchProgress(i + 1, total, it.subject || '(no subject)');
+    try {
+      const filed = await fileOneSelectedMessage(it, folderPath, sharedTags);
+      results.push({ subject: it.subject || '(no subject)', ok: true, url: filed.url, filename: filed.filename });
+    } catch (err) {
+      console.error('Batch item failed:', it.subject, err);
+      results.push({ subject: it.subject || '(no subject)', ok: false, error: err.message });
+    }
+  }
+
+  showBatchSummary(results);
+  batchInProgress = false;
+  fileBtn.disabled = false;
+  updatePrimaryButtonLabel();
+}
+
+// File one message identified by a selected-items entry. Performs:
+//   1. Resolve the Graph/REST id (selected items return EWS-format ids).
+//   2. Fetch message metadata (subject, from, to, date) for the SharePoint columns.
+//   3. Fetch MIME via Graph.
+//   4. Upload to the pre-resolved folder.
+//   5. Write list-item metadata.
+// Returns { url, filename }.
+async function fileOneSelectedMessage(item, folderPath, sharedTags) {
+  // 1. Resolve Graph id
+  let graphId = item.itemId;
+  try {
+    graphId = Office.context.mailbox.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0);
+  } catch (e) {
+    // newer hosts already return REST-format ids
+  }
+
+  const token = await getToken();
+
+  // 2. Fetch message metadata for filename + SharePoint columns
+  const metaUrl = 'https://graph.microsoft.com/v1.0/me/messages/' + graphId +
+    '?$select=subject,from,toRecipients,sentDateTime,receivedDateTime,hasAttachments';
+  let meta = {};
+  try {
+    const r = await fetch(metaUrl, { headers: { 'Authorization': 'Bearer ' + token } });
+    if (r.ok) meta = await r.json();
+  } catch (e) {
+    // metadata is best-effort; we can still file with partial info
+  }
+
+  // 3. Fetch MIME content
+  const mime = await getEmailMime(graphId);
+
+  // 4. Filename - prefer the message's own date over today's
+  const fauxItem = {
+    subject: meta.subject || item.subject || 'No subject',
+    dateTimeCreated: meta.sentDateTime || meta.receivedDateTime || new Date().toISOString()
+  };
+  const filename = makeFilename(fauxItem);
+
+  // 5. Upload
+  const uploaded = await uploadFile(folderPath, filename, mime);
+
+  // 6. Metadata fields. Build a synthetic "item" shape so setMetadataForItem can
+  // pull subject/from/to/date from a known-good source rather than currentItem.
+  const fromName = meta.from && meta.from.emailAddress ? (meta.from.emailAddress.name || '') : '';
+  const fromAddr = meta.from && meta.from.emailAddress ? (meta.from.emailAddress.address || '') : '';
+  const toList = (meta.toRecipients || []).map(r => r.emailAddress && r.emailAddress.address).filter(Boolean).join('; ');
+  const itemShape = {
+    subject: meta.subject || item.subject || '',
+    fromName: fromName,
+    fromAddress: fromAddr,
+    toList: toList,
+    date: meta.sentDateTime || meta.receivedDateTime || null
+  };
+  await setMetadataForItem(uploaded, itemShape, sharedTags);
+
+  return { url: uploaded.webUrl, filename: filename };
+}
+
+// Write list-item metadata from an explicit shape rather than currentItem.
+// Mirrors setMetadata() but doesn't depend on the global currentItem.
+async function setMetadataForItem(driveItem, shape, sharedTags) {
+  const candidateFields = {
+    EmailSubject: shape.subject || '',
+    EmailFrom: shape.fromAddress || '',
+    EmailFromName: shape.fromName || '',
+    EmailTo: shape.toList || '',
+    EmailDate: shape.date || null,
+    FiledClient: sharedTags.client || '',
+    FiledProject: sharedTags.project || '',
+    FiledCategory: sharedTags.category || '',
+    FiledNotes: sharedTags.notes || '',
+    FiledBy: currentAccount ? currentAccount.username : '',
+    FiledAt: new Date().toISOString()
+  };
+  const fields = {};
+  for (const [k, v] of Object.entries(candidateFields)) {
+    if (v !== null && v !== '') fields[k] = v;
+  }
+  try {
+    await graph('/drives/' + selectedLib.id + '/items/' + driveItem.id + '/listItem/fields', {
+      method: 'PATCH',
+      body: JSON.stringify(fields)
+    });
+  } catch (e) {
+    console.warn('Some metadata fields could not be set on batch item:', e.message);
+  }
+}
+
+// Per-iteration progress line. Replaces the regular five-step indicator with a
+// batch-level "Filing X of N" status so the user can see steady progress through
+// the batch even when individual messages are quick.
+function showBatchProgress(current, total, subject) {
+  const pct = Math.round((current - 1) / total * 100);
+  document.getElementById('status-area').innerHTML = `
+    <div class="batch-progress">
+      <div class="bp-head">
+        <strong>Filing ${current} of ${total}</strong>
+        <span class="bp-pct">${pct}%</span>
+      </div>
+      <div class="bp-bar"><div class="bp-fill" style="width:${pct}%"></div></div>
+      <div class="bp-subject">${escapeHtml(subject)}</div>
+    </div>`;
+}
+
+// Final summary card. Lists every item with a ✓ or ✕, with the error for any failures.
+function showBatchSummary(results) {
+  const ok = results.filter(r => r.ok);
+  const fail = results.filter(r => !r.ok);
+  const titleCls = fail.length === 0 ? '' : (ok.length === 0 ? 'error' : 'partial');
+  const titleText = fail.length === 0
+    ? `✓ Filed ${ok.length} of ${results.length}`
+    : (ok.length === 0
+        ? `⚠ Filing failed — 0 of ${results.length}`
+        : `Filed ${ok.length} of ${results.length} — ${fail.length} failed`);
+
+  const rows = results.map(r => {
+    if (r.ok) {
+      return `<div class="bs-row ok">
+        <span class="bs-mark">✓</span>
+        <span class="bs-subj">${escapeHtml(r.subject)}</span>
+        <a class="bs-link" href="${escapeHtml(r.url)}" target="_blank" rel="noopener">Open</a>
+      </div>`;
+    }
+    return `<div class="bs-row fail">
+      <span class="bs-mark">✕</span>
+      <span class="bs-subj">${escapeHtml(r.subject)}</span>
+      <span class="bs-err">${escapeHtml(r.error || 'unknown error')}</span>
+    </div>`;
+  }).join('');
+
+  document.getElementById('status-area').innerHTML = `
+    <div class="result-card batch-summary ${titleCls}">
+      <div class="ttl">${titleText}</div>
+      <div class="bs-list">${rows}</div>
+    </div>`;
+
+  // Add successful ones to the "recently filed" list
+  for (const r of ok) {
+    addToRecent({
+      subject: r.subject,
+      siteName: selectedSite.displayName || selectedSite.name,
+      libName: selectedLib.name,
+      filename: r.filename,
+      url: r.url,
+      date: new Date().toISOString()
+    });
   }
 }
 

@@ -263,6 +263,39 @@
   .email-preview .meta-row strong { color:var(--text); font-weight:600; min-width:40px; display:inline-block; }
   .email-preview .meta-row.with-attach { color:var(--amber); margin-top:3px; }
 
+  /* Batch (multi-select) preview banner */
+  .email-preview.batch-mode { background:linear-gradient(180deg,var(--blue-pale),white); border-color:var(--blue-accent); }
+  .batch-banner .batch-count { font-size:14px; color:var(--navy-deep); font-weight:700; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
+  .batch-banner .batch-count::before { content:""; width:6px; height:6px; background:var(--blue-accent); border-radius:50%; box-shadow:0 0 0 3px rgba(57,163,220,0.18); }
+  .batch-banner .batch-list { font-size:11.5px; color:var(--text); line-height:1.5; margin-bottom:6px; }
+  .batch-banner .batch-row { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .batch-banner .batch-more { color:var(--text-muted); font-style:italic; }
+  .batch-banner .batch-hint { font-size:10.5px; color:var(--text-muted); line-height:1.5; padding-top:6px; border-top:1px dashed var(--rule); }
+
+  /* Batch progress bar */
+  .batch-progress { background:white; border:1px solid var(--rule); border-left:3px solid var(--blue-accent); border-radius:6px; padding:10px 12px; margin-top:8px; }
+  .batch-progress .bp-head { display:flex; justify-content:space-between; align-items:baseline; font-size:12px; color:var(--navy); margin-bottom:6px; }
+  .batch-progress .bp-pct { font-size:11px; color:var(--text-muted); font-variant-numeric:tabular-nums; }
+  .batch-progress .bp-bar { height:6px; background:var(--blue-pale); border-radius:3px; overflow:hidden; }
+  .batch-progress .bp-fill { height:100%; background:linear-gradient(90deg,var(--blue-mid),var(--blue-accent)); transition:width 0.25s ease; }
+  .batch-progress .bp-subject { font-size:11px; color:var(--text-muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  /* Batch summary card */
+  .result-card.batch-summary .ttl { font-size:13px; }
+  .result-card.batch-summary.partial { border-left:3px solid var(--amber); }
+  .result-card.batch-summary.error { border-left:3px solid var(--red); }
+  .bs-list { display:flex; flex-direction:column; gap:4px; margin-top:8px; max-height:240px; overflow-y:auto; }
+  .bs-row { display:flex; align-items:center; gap:8px; font-size:11.5px; padding:4px 6px; border-radius:4px; }
+  .bs-row.ok { background:rgba(46,158,91,0.06); }
+  .bs-row.fail { background:rgba(193,60,60,0.06); }
+  .bs-row .bs-mark { font-weight:700; width:14px; text-align:center; flex:none; }
+  .bs-row.ok .bs-mark { color:var(--green); }
+  .bs-row.fail .bs-mark { color:var(--red); }
+  .bs-row .bs-subj { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text); }
+  .bs-row .bs-link { font-size:11px; color:var(--blue-mid); text-decoration:none; flex:none; }
+  .bs-row .bs-link:hover { text-decoration:underline; }
+  .bs-row .bs-err { font-size:10.5px; color:var(--red); flex:0 0 auto; max-width:50%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
   .form-section { background:white; border:1px solid var(--rule); border-radius:6px; padding:12px 14px; margin-bottom:12px; }
   .form-section .section-title { font-size:11px; letter-spacing:1.2px; text-transform:uppercase; color:var(--navy); font-weight:700; margin-bottom:10px; padding-bottom:5px; border-bottom:1.5px solid var(--blue-accent); display:flex; align-items:center; gap:6px; }
   .form-section .section-title .num { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:50%; background:linear-gradient(135deg,var(--navy),var(--blue-mid)); color:white; font-size:10px; }
