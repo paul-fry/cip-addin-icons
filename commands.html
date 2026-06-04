@@ -1,14 +1,14 @@
 <!DOCTYPE html>
-<html>
+<html lang="en-GB">
 <head>
-<meta charset="UTF-8">
-<title>cip File Email · Commands</title>
-<script src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
-<script>
-Office.onReady(() => {
-  // No function commands defined - taskpane is the entry point
-});
-</script>
+  <meta charset="UTF-8">
+  <title>cip File Email — Event Runtime</title>
+  <!-- This page hosts the OnMessageSend event handler. It runs in a lightweight
+       runtime context (no UI), so we keep it minimal: load Office.js + commands.js. -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="commands.js"></script>
 </head>
-<body></body>
+<body>
+  <!-- No UI here. The handler runs invisibly and opens a separate dialog when needed. -->
+</body>
 </html>
