@@ -1134,47 +1134,60 @@ async function markEmailInOutlook(graphId) {
   const wantPrefix = !!(cfg.filedSubjectPrefix && cfg.filedSubjectPrefix.trim());
   if (!wantCategory && !wantPrefix) return;
 
+  // Read current state once (to avoid clobbering existing categories / re-prefixing).
+  let msg;
   try {
-    // Read current state so we don't clobber existing categories or
-    // re-prepend the subject prefix when re-filing.
-    const msg = await graph('/me/messages/' + graphId + '?$select=categories,subject');
-    const patch = {};
+    msg = await graph('/me/messages/' + graphId + '?$select=categories,subject');
+  } catch (e) {
+    console.warn('Could not read message to mark as filed:', e && e.message);
+    return;
+  }
 
-    if (wantCategory) {
+  // 1. CATEGORY - applied in its OWN request. Categories are writable on any
+  //    message (sent or received) with Mail.ReadWrite. This is the reliable
+  //    "filed" marker. It must NOT be combined with the subject update below,
+  //    because a subject failure would otherwise take the category down with it.
+  if (wantCategory) {
+    try {
       const existing = Array.isArray(msg.categories) ? msg.categories.slice() : [];
       if (!existing.includes(cfg.filedCategory)) {
         existing.push(cfg.filedCategory);
-        patch.categories = existing;
+        await graph('/me/messages/' + graphId, {
+          method: 'PATCH',
+          body: JSON.stringify({ categories: existing })
+        });
       }
+    } catch (e) {
+      // 403 here usually means Mail.ReadWrite hasn't been consented yet.
+      console.warn('Could not set filed category:', e && e.message);
     }
+  }
 
-    if (wantPrefix) {
+  // 2. SUBJECT PREFIX - SEPARATE, best-effort request. Microsoft Graph only
+  //    permits editing a message's subject while it is a draft (isDraft = true).
+  //    Filed messages are always already sent/received, so this normally fails
+  //    with a 400 - that is EXPECTED and harmless. It's kept isolated so it can
+  //    never block the category above. (Desktop COM add-ins like CloudFiler can
+  //    edit subjects via MAPI; a web add-in using Graph cannot.)
+  if (wantPrefix) {
+    try {
       const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
       const newPrefix = cfg.filedSubjectPrefix.replace(/\{date\}/g, today);
       const currentSubject = msg.subject || '';
-      // Match any "[Filed on YYYY-MM-DD] " style prefix we've added before -
-      // we replace it with the latest date rather than stacking prefixes.
       const existingPrefixRegex = /^\[Filed on \d{4}-\d{2}-\d{2}\]\s*/;
-      let newSubject;
-      if (existingPrefixRegex.test(currentSubject)) {
-        newSubject = currentSubject.replace(existingPrefixRegex, newPrefix);
-      } else {
-        newSubject = newPrefix + currentSubject;
+      const newSubject = existingPrefixRegex.test(currentSubject)
+        ? currentSubject.replace(existingPrefixRegex, newPrefix)
+        : newPrefix + currentSubject;
+      if (newSubject !== currentSubject) {
+        await graph('/me/messages/' + graphId, {
+          method: 'PATCH',
+          body: JSON.stringify({ subject: newSubject })
+        });
       }
-      if (newSubject !== currentSubject) patch.subject = newSubject;
+    } catch (e) {
+      // Expected on sent/received messages - Graph allows subject edits on drafts only.
+      console.info('Subject prefix not applied (Graph allows subject edits on drafts only):', e && e.message);
     }
-
-    if (Object.keys(patch).length === 0) return; // nothing to change
-
-    await graph('/me/messages/' + graphId, {
-      method: 'PATCH',
-      body: JSON.stringify(patch)
-    });
-  } catch (e) {
-    // Don't fail the whole flow over a labelling problem - log and continue.
-    // Most common cause: Mail.ReadWrite not yet consented in Entra (user is
-    // still on the old Mail.Read consent). The fix is admin-side, not code.
-    console.warn('Could not mark email as filed in Outlook:', e && e.message);
   }
 }
 
