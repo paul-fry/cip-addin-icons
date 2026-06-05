@@ -159,7 +159,7 @@ async function initAuth() {
       authority: 'https://login.microsoftonline.com/' + cfg.tenantId,
       redirectUri: window.location.origin + window.location.pathname
     },
-    cache: { cacheLocation: 'sessionStorage' }
+    cache: { cacheLocation: 'localStorage' }
   });
   await msalInstance.initialize();
   const accounts = msalInstance.getAllAccounts();
@@ -196,7 +196,9 @@ async function onSignedIn() {
     if (mode === 'compose') {
       onRecipientsChanged();
     } else {
-      // Read-mode: check whether this is the just-sent email being prompted for filing
+      // Read-mode: first auto-file any queued sends, then fall back to the
+      // manual post-send banner for anything the poller couldn't match.
+      await drainSentQueue();
       checkPostSendPrompt();
     }
   } catch (e) {
@@ -668,9 +670,15 @@ async function saveComposeSettings() {
       for (const [k, v] of Object.entries(settings)) props.set(k, v);
       props.saveAsync(saveResult => {
         if (saveResult.status === Office.AsyncResultStatus.Succeeded) {
-          toast(fileOnSend
-            ? 'Saved. This email will be filed after you click Send.'
-            : 'File-on-send disabled for this email.', 'success');
+          if (fileOnSend) {
+            // Stage the filing intent to the localStorage queue so the Sent
+            // Items poller can file the message automatically after it's sent -
+            // no need for the user to open the sent copy.
+            stageSendQueueEntry(settings);
+            toast('Done. This email will be filed automatically after you send it.', 'success');
+          } else {
+            toast('File-on-send disabled for this email.', 'success');
+          }
           resolve();
         } else {
           toast('Could not save: ' + (saveResult.error && saveResult.error.message), 'error');
@@ -700,11 +708,199 @@ function loadComposeState() {
 }
 
 // ============================================================
+// AUTOMATIC FILE-ON-SEND (Sent Items poller)
+// ============================================================
+// When the user arms file-on-send in compose mode, we stage the destination
+// and tags to a localStorage queue keyed by recipient + arm time. After the
+// message is sent, the next time the taskpane loads (read mode) we poll Sent
+// Items via Graph, match the queued intent to the actual sent message, and
+// file it automatically - no banner, no opening the sent copy.
+//
+// Limitations (documented, acceptable for single-device use):
+//   - The queue lives in localStorage, so arming on one device and filing on
+//     another won't match. The manual post-send banner remains as a fallback.
+//   - Matching is by recipient + sent-after-arm-time. Sending two near-identical
+//     messages to the same recipient in quick succession could mis-match; the
+//     earliest unfiled match wins.
+// ============================================================
+
+const SEND_QUEUE_KEY = 'cip-file-on-send-queue';
+const FILED_IDS_KEY  = 'cip-filed-message-ids';
+
+function readSendQueue() {
+  try { return JSON.parse(localStorage.getItem(SEND_QUEUE_KEY) || '[]'); }
+  catch (e) { return []; }
+}
+function writeSendQueue(q) {
+  try { localStorage.setItem(SEND_QUEUE_KEY, JSON.stringify(q)); } catch (e) {}
+}
+function readFiledSet() {
+  try { return JSON.parse(localStorage.getItem(FILED_IDS_KEY) || '[]'); }
+  catch (e) { return []; }
+}
+function addToFiledSet(internetMessageId) {
+  if (!internetMessageId) return;
+  try {
+    const s = readFiledSet();
+    if (!s.includes(internetMessageId)) {
+      s.push(internetMessageId);
+      // Cap the set so it doesn't grow forever
+      while (s.length > 500) s.shift();
+      localStorage.setItem(FILED_IDS_KEY, JSON.stringify(s));
+    }
+  } catch (e) {}
+}
+
+// Capture recipients + subject from the compose item and push a queue entry.
+function stageSendQueueEntry(settings) {
+  const item = Office.context.mailbox.item;
+  if (!item || !item.to || typeof item.to.getAsync !== 'function') return;
+
+  item.to.getAsync(res => {
+    const recips = (res.status === Office.AsyncResultStatus.Succeeded && Array.isArray(res.value))
+      ? res.value.map(r => (r.emailAddress || '').toLowerCase()).filter(Boolean)
+      : [];
+
+    const finalise = (subject) => {
+      const q = readSendQueue();
+      q.push({
+        id: 'q_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+        armedAt: new Date().toISOString(),
+        recipients: recips,
+        subject: subject || '',
+        dest: {
+          siteId: settings.cip_pending_site_id,
+          siteName: settings.cip_pending_site_name,
+          libId: settings.cip_pending_lib_id,
+          libName: settings.cip_pending_lib_name,
+          folder: settings.cip_pending_folder || ''
+        },
+        tags: {
+          client: settings.cip_pending_client || '',
+          project: settings.cip_pending_project || '',
+          category: settings.cip_pending_category || '',
+          notes: settings.cip_pending_notes || ''
+        },
+        attempts: 0
+      });
+      writeSendQueue(q);
+    };
+
+    if (item.subject && typeof item.subject.getAsync === 'function') {
+      item.subject.getAsync(sres =>
+        finalise(sres.status === Office.AsyncResultStatus.Succeeded ? sres.value : ''));
+    } else {
+      finalise('');
+    }
+  });
+}
+
+// Poll Sent Items and file any queued intents whose message has now been sent.
+async function drainSentQueue() {
+  let q = readSendQueue();
+  if (!q.length) return;
+
+  const now = Date.now();
+  const MAX_AGE_MS = 24 * 60 * 60 * 1000;   // expire after 24h
+  const MAX_ATTEMPTS = 8;                    // stop retrying a stubborn entry
+
+  q = q.filter(e => (now - new Date(e.armedAt).getTime()) < MAX_AGE_MS && (e.attempts || 0) < MAX_ATTEMPTS);
+  if (!q.length) { writeSendQueue(q); return; }
+
+  let sent = [];
+  try {
+    const res = await graph('/me/mailFolders/sentitems/messages?$top=25&$orderby=sentDateTime desc&$select=id,subject,toRecipients,sentDateTime,internetMessageId');
+    sent = res.value || [];
+  } catch (e) {
+    console.warn('Sent Items poll failed:', e && e.message);
+    writeSendQueue(q);   // persist expiry cleanup
+    return;
+  }
+
+  const filedSet = readFiledSet();
+  const remaining = [];
+
+  for (const entry of q) {
+    const armedMs = new Date(entry.armedAt).getTime();
+    const candidates = sent.filter(m => {
+      if (filedSet.includes(m.internetMessageId)) return false;
+      const sentMs = new Date(m.sentDateTime).getTime();
+      if (sentMs < armedMs - 60000) return false;   // 1 min clock-skew tolerance
+      const toAddrs = (m.toRecipients || []).map(r =>
+        (r.emailAddress && r.emailAddress.address || '').toLowerCase());
+      return entry.recipients.length === 0 || entry.recipients.some(r => toAddrs.includes(r));
+    }).sort((a, b) => new Date(a.sentDateTime) - new Date(b.sentDateTime));
+
+    const match = candidates[0];
+    if (!match) { remaining.push(entry); continue; }   // not sent yet - keep waiting
+
+    try {
+      await fileQueuedMessage(match, entry);
+      addToFiledSet(match.internetMessageId);
+      // success - entry consumed, do not re-add
+    } catch (e) {
+      console.warn('Auto-file of sent message failed (will retry):', e && e.message);
+      entry.attempts = (entry.attempts || 0) + 1;
+      remaining.push(entry);
+    }
+  }
+  writeSendQueue(remaining);
+}
+
+// Upload one sent message to its queued destination. Reuses the existing
+// upload helpers by temporarily pointing the destination globals at the
+// queued site/library, then restoring them.
+async function fileQueuedMessage(sentMsg, entry) {
+  const prevSite = selectedSite, prevLib = selectedLib;
+  selectedSite = { id: entry.dest.siteId, displayName: entry.dest.siteName, name: entry.dest.siteName };
+  selectedLib  = { id: entry.dest.libId, name: entry.dest.libName };
+
+  try {
+    accessToken = await getToken();
+
+    const mime = await getEmailMime(sentMsg.id);   // sentMsg.id is already a Graph id
+    const folderPath = entry.dest.folder ? await ensureFolder(entry.dest.folder) : '';
+    const fauxItem = {
+      subject: sentMsg.subject || 'No subject',
+      dateTimeCreated: sentMsg.sentDateTime || new Date().toISOString()
+    };
+    const filename = makeFilename(fauxItem);
+    const uploaded = await uploadFile(folderPath, filename, mime);
+
+    const itemShape = {
+      subject: sentMsg.subject || '',
+      fromName: currentAccount ? currentAccount.name : '',
+      fromAddress: currentAccount ? currentAccount.username : '',
+      toList: (sentMsg.toRecipients || []).map(r => r.emailAddress && r.emailAddress.address).filter(Boolean).join('; '),
+      date: sentMsg.sentDateTime || null
+    };
+    await setMetadataForItem(uploaded, itemShape, entry.tags);
+    await markEmailInOutlook(sentMsg.id);
+
+    addToRecent({
+      subject: sentMsg.subject || '(no subject)',
+      siteName: entry.dest.siteName,
+      libName: entry.dest.libName,
+      filename: filename,
+      url: uploaded.webUrl,
+      date: new Date().toISOString()
+    });
+
+    toast('Filed sent email: ' + (sentMsg.subject || '(no subject)'), 'success');
+  } finally {
+    selectedSite = prevSite;
+    selectedLib = prevLib;
+  }
+}
+
+// ============================================================
 // POST-SEND PROMPT - shown in read mode when opening a just-sent email that was marked for filing
 // ============================================================
 
 function checkPostSendPrompt() {
   if (!currentItem || mode !== 'read') return;
+  // If the poller already auto-filed this message, don't offer to file it again.
+  if (currentItem.internetMessageId && readFiledSet().includes(currentItem.internetMessageId)) return;
   currentItem.loadCustomPropertiesAsync(result => {
     if (result.status !== Office.AsyncResultStatus.Succeeded) return;
     const props = result.value;
@@ -808,6 +1004,15 @@ async function doFileEmail() {
   fileBtn.disabled = true;
   fileBtn.textContent = 'Filing...';
 
+  // Compute the Graph id once. Used by both getEmailMime (to fetch MIME) and
+  // markEmailInOutlook (to apply the category + subject prefix at the end).
+  let graphId;
+  try {
+    graphId = Office.context.mailbox.convertToRestId(currentItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+  } catch (e) {
+    graphId = currentItem.itemId;
+  }
+
   showProgress([
     { id: 'fetch', label: 'Fetching email content from Microsoft Graph', status: 'active' },
     { id: 'folder', label: 'Preparing destination folder', status: 'pending' },
@@ -819,7 +1024,7 @@ async function doFileEmail() {
   try {
     // 1. Get the email MIME content via EWS (Outlook desktop & web)
     setStep('fetch', 'active');
-    const mime = await getEmailMime();
+    const mime = await getEmailMime(graphId);
     setStep('fetch', 'done');
 
     // 2. Resolve / create the destination folder
@@ -839,7 +1044,9 @@ async function doFileEmail() {
     await setMetadata(uploadedItem);
     setStep('meta', 'done');
 
-    // 5. Mark the email itself as filed via Office.js custom properties
+    // 5. Mark the email as filed (custom props for the add-in's own logic,
+    //    plus an Outlook category and subject prefix that are visible to the
+    //    user in their mail list without opening the taskpane).
     setStep('mark', 'active');
     await saveFiledMarkers({
       url: uploadedItem.webUrl,
@@ -848,6 +1055,7 @@ async function doFileEmail() {
       libName: selectedLib.name,
       filedBy: currentAccount.username
     });
+    await markEmailInOutlook(graphId);
     setStep('mark', 'done');
 
     // Done
@@ -907,6 +1115,67 @@ function saveFiledMarkers(info) {
       });
     });
   });
+}
+
+// Mark the original message in Outlook itself so the filing is visible
+// in the user's mail list without opening the add-in. Adds an Outlook
+// category (a coloured pill) and prepends a subject prefix. Both signals
+// are configurable in config.js. Requires Graph Mail.ReadWrite.
+//
+// graphId is the message's REST/Graph id (already converted from EWS).
+// Returns nothing - failures are logged and swallowed, because the
+// SharePoint-side filing has already succeeded and we don't want a
+// labelling glitch to look like a filing failure.
+async function markEmailInOutlook(graphId) {
+  const cfg = window.CIP_CONFIG || {};
+  if (!cfg.markFiledInOutlook) return;
+
+  const wantCategory = !!(cfg.filedCategory && cfg.filedCategory.trim());
+  const wantPrefix = !!(cfg.filedSubjectPrefix && cfg.filedSubjectPrefix.trim());
+  if (!wantCategory && !wantPrefix) return;
+
+  try {
+    // Read current state so we don't clobber existing categories or
+    // re-prepend the subject prefix when re-filing.
+    const msg = await graph('/me/messages/' + graphId + '?$select=categories,subject');
+    const patch = {};
+
+    if (wantCategory) {
+      const existing = Array.isArray(msg.categories) ? msg.categories.slice() : [];
+      if (!existing.includes(cfg.filedCategory)) {
+        existing.push(cfg.filedCategory);
+        patch.categories = existing;
+      }
+    }
+
+    if (wantPrefix) {
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const newPrefix = cfg.filedSubjectPrefix.replace(/\{date\}/g, today);
+      const currentSubject = msg.subject || '';
+      // Match any "[Filed on YYYY-MM-DD] " style prefix we've added before -
+      // we replace it with the latest date rather than stacking prefixes.
+      const existingPrefixRegex = /^\[Filed on \d{4}-\d{2}-\d{2}\]\s*/;
+      let newSubject;
+      if (existingPrefixRegex.test(currentSubject)) {
+        newSubject = currentSubject.replace(existingPrefixRegex, newPrefix);
+      } else {
+        newSubject = newPrefix + currentSubject;
+      }
+      if (newSubject !== currentSubject) patch.subject = newSubject;
+    }
+
+    if (Object.keys(patch).length === 0) return; // nothing to change
+
+    await graph('/me/messages/' + graphId, {
+      method: 'PATCH',
+      body: JSON.stringify(patch)
+    });
+  } catch (e) {
+    // Don't fail the whole flow over a labelling problem - log and continue.
+    // Most common cause: Mail.ReadWrite not yet consented in Entra (user is
+    // still on the old Mail.Read consent). The fix is admin-side, not code.
+    console.warn('Could not mark email as filed in Outlook:', e && e.message);
+  }
 }
 
 // Get the email as MIME using Microsoft Graph
@@ -1214,6 +1483,10 @@ async function fileOneSelectedMessage(item, folderPath, sharedTags) {
     date: meta.sentDateTime || meta.receivedDateTime || null
   };
   await setMetadataForItem(uploaded, itemShape, sharedTags);
+
+  // Outlook-visible filed marker (category + subject prefix). Best-effort -
+  // failure here doesn't undo the SharePoint upload that just succeeded.
+  await markEmailInOutlook(graphId);
 
   return { url: uploaded.webUrl, filename: filename };
 }
