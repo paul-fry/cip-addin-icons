@@ -50,37 +50,68 @@ async function init() {
     return;
   }
 
-  // cacheLocation:'localStorage' so we read the same session the taskpane
-  // wrote on sign-in. Origin is the same for both pages so this just works.
+  // The dialog runs in its OWN storage partition - it CANNOT see the taskpane's
+  // MSAL session (Chromium 115+ storage partitioning). So the dialog maintains
+  // its own session: the user signs in here once, MSAL caches it in the dialog's
+  // partition, and every subsequent send authenticates silently.
+  //   - storeAuthStateInCookie:true improves redirect reliability in WebView2
+  //     (classic Outlook desktop).
+  //   - redirectUri is this dialog page itself; it MUST be registered as a SPA
+  //     redirect URI in the Entra app registration.
   msalInstance = new msal.PublicClientApplication({
     auth: {
       clientId: cfg.clientId,
       authority: 'https://login.microsoftonline.com/' + cfg.tenantId,
       redirectUri: window.location.origin + window.location.pathname
     },
-    cache: { cacheLocation: 'localStorage' }
+    cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: true }
   });
   await msalInstance.initialize();
 
-  const accounts = msalInstance.getAllAccounts();
-  if (accounts.length === 0) {
-    showSignInPrompt();
-    return;
-  }
-  currentAccount = accounts[0];
-
+  // STEP 1: handle a redirect response - we may be returning from loginRedirect.
+  let redirectResponse = null;
   try {
-    accessToken = await getToken();
+    redirectResponse = await msalInstance.handleRedirectPromise();
   } catch (e) {
-    // Silent token failed (account expired, password changed, etc.). Don't
-    // try to popup-prompt from inside the dialog - show the inline prompt.
-    console.warn('Silent token failed:', e);
-    showSignInPrompt();
-    return;
+    console.warn('handleRedirectPromise error:', e && e.message);
+  }
+  if (redirectResponse && redirectResponse.account) {
+    currentAccount = redirectResponse.account;
+    msalInstance.setActiveAccount(currentAccount);
+    // loginRedirect with scopes returns a usable access token directly.
+    if (redirectResponse.accessToken) accessToken = redirectResponse.accessToken;
+  } else {
+    const accounts = msalInstance.getAllAccounts();
+    if (accounts.length > 0) {
+      currentAccount = accounts[0];
+      msalInstance.setActiveAccount(currentAccount);
+    }
   }
 
-  document.getElementById('form-area').style.display = 'block';
-  await loadSites();
+  // STEP 2: if we have an account, get a token silently (unless we already got
+  // one from the redirect response above).
+  if (currentAccount) {
+    try {
+      if (!accessToken) accessToken = await getToken();
+      document.getElementById('form-area').style.display = 'block';
+      await loadSites();
+      return;
+    } catch (e) {
+      console.warn('Silent token failed, will sign in interactively:', e && e.message);
+    }
+  }
+
+  // STEP 3: no usable session - sign in interactively INSIDE the dialog.
+  // This navigates the dialog window to the Microsoft sign-in page and back.
+  // After the round trip, the page reloads and STEP 1 picks up the response.
+  try {
+    showSigningIn();
+    await msalInstance.loginRedirect({ scopes: cfg.scopes });
+    // loginRedirect navigates away; nothing after this runs until we return.
+  } catch (e) {
+    console.error('loginRedirect failed:', e);
+    showSignInError('Could not start sign-in: ' + (e && e.message ? e.message : e));
+  }
 }
 
 async function getToken() {
@@ -222,10 +253,22 @@ function showBanner(msg, type) {
   b.textContent = msg;
 }
 
-function showSignInPrompt() {
+// Shown briefly while the dialog redirects to the Microsoft sign-in page.
+function showSigningIn() {
   document.getElementById('form-area').style.display = 'none';
-  document.getElementById('signin-area').style.display = 'block';
-  // Disable File - signing in is required first
+  const area = document.getElementById('signin-area');
+  area.style.display = 'block';
+  area.innerHTML = '<strong>Signing in…</strong>Redirecting you to sign in. This happens once - after that, filing on send is instant.';
+  document.getElementById('btn-file').disabled = true;
+}
+
+// Shown only if interactive sign-in itself fails to start.
+function showSignInError(message) {
+  document.getElementById('form-area').style.display = 'none';
+  const area = document.getElementById('signin-area');
+  area.style.display = 'block';
+  area.innerHTML = '<strong>Sign-in problem</strong>' + escapeHtml(message || 'Could not sign in.') +
+    ' You can still choose "Send without filing" and file this email manually later.';
   document.getElementById('btn-file').disabled = true;
 }
 
