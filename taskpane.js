@@ -802,20 +802,46 @@ function stageSendQueueEntry(settings) {
 const ONEDRIVE_PENDING_PATH = '/me/drive/root:/cip-file-email-pending.json';
 
 async function readOneDriveQueue() {
-  let res;
+  // Read the file's metadata first to get a pre-authed download URL. This is
+  // more reliable than the /content redirect, which can fail CORS when fetched
+  // with an Authorization header from an add-in origin.
+  let meta;
   try {
-    res = await graph(ONEDRIVE_PENDING_PATH + ':/content');
+    meta = await graph(ONEDRIVE_PENDING_PATH);   // DriveItem JSON (incl. downloadUrl)
   } catch (e) {
-    if (/404/.test(e && e.message || '')) return [];   // no queue file yet
+    if (/404/.test(e && e.message || '')) { console.log('[cip] OneDrive queue: no file yet'); return []; }
     throw e;
   }
-  if (Array.isArray(res)) return res;                  // graph() already parsed JSON
-  let data;
-  if (res && typeof res.text === 'function') data = await res.text();
-  else if (typeof res === 'string') data = res;
-  else return [];
-  try { const arr = JSON.parse(data); return Array.isArray(arr) ? arr : []; }
-  catch (e) { return []; }
+
+  let txt = null;
+  const dl = meta && meta['@microsoft.graph.downloadUrl'];
+  if (dl) {
+    try {
+      const r = await fetch(dl);              // pre-authed short-lived URL - no auth header
+      if (r.ok) txt = await r.text();
+      else console.warn('[cip] OneDrive downloadUrl returned', r.status);
+    } catch (e) {
+      console.warn('[cip] OneDrive downloadUrl fetch failed, trying /content:', e && e.message);
+    }
+  }
+
+  if (txt === null) {
+    // Fallback to the /content endpoint.
+    const res = await graph(ONEDRIVE_PENDING_PATH + ':/content');
+    if (Array.isArray(res)) { console.log('[cip] OneDrive queue entries:', res.length); return res; }
+    if (res && typeof res.text === 'function') txt = await res.text();
+    else if (typeof res === 'string') txt = res;
+    else return [];
+  }
+
+  try {
+    const arr = JSON.parse(txt);
+    console.log('[cip] OneDrive queue entries:', Array.isArray(arr) ? arr.length : 0);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    console.warn('[cip] could not parse OneDrive queue JSON:', e && e.message);
+    return [];
+  }
 }
 
 async function writeOneDriveQueue(arr) {
@@ -846,6 +872,8 @@ async function drainSentQueue() {
   const entries = localQ.map(e => { e._source = 'local'; return e; })
     .concat(driveQ.map(e => { e._source = 'onedrive'; return e; }));
 
+  console.log('[cip] drainSentQueue: local=' + localQ.length + ' onedrive=' + driveQ.length);
+
   if (!entries.length) {
     writeSendQueue(localQ.map(stripSource));
     if (driveReadOk) { try { await writeOneDriveQueue(driveQ.map(stripSource)); } catch (e) {} }
@@ -856,6 +884,7 @@ async function drainSentQueue() {
   try {
     const res = await graph('/me/mailFolders/sentitems/messages?$top=25&$orderby=sentDateTime desc&$select=id,subject,toRecipients,sentDateTime,internetMessageId');
     sent = res.value || [];
+    console.log('[cip] Sent Items fetched:', sent.length);
   } catch (e) {
     console.warn('Sent Items poll failed:', e && e.message);
     return;   // leave both queues untouched; retry next time the taskpane opens
@@ -878,16 +907,19 @@ async function drainSentQueue() {
 
     const match = candidates[0];
     if (!match) {
+      console.log('[cip] no match yet for entry armed at', entry.armedAt, 'to', (entry.recipients || []).join(','));
       (entry._source === 'onedrive' ? keepDrive : keepLocal).push(entry);
       continue;
     }
 
+    console.log('[cip] match found, filing:', match.subject);
     try {
       await fileQueuedMessage(match, entry);
       addToFiledSet(match.internetMessageId);
+      console.log('[cip] filed OK:', match.subject);
       // filed - entry consumed
     } catch (e) {
-      console.warn('Auto-file of sent message failed (will retry):', e && e.message);
+      console.warn('[cip] Auto-file failed (will retry):', e && e.message);
       entry.attempts = (entry.attempts || 0) + 1;
       (entry._source === 'onedrive' ? keepDrive : keepLocal).push(entry);
     }
