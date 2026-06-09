@@ -200,6 +200,10 @@ async function onSignedIn() {
       // manual post-send banner for anything the poller couldn't match.
       await drainSentQueue();
       checkPostSendPrompt();
+      // A just-sent message can take a few seconds to appear in Sent Items.
+      // Run one more pass shortly after, so it gets caught without the user
+      // having to reopen the add-in. Guarded so errors never surface to the UI.
+      setTimeout(() => { drainSentQueue().catch(e => console.warn('[cip] re-poll failed:', e && e.message)); }, 25000);
     }
   } catch (e) {
     toast('Could not connect to SharePoint: ' + e.message, 'error');
@@ -882,7 +886,7 @@ async function drainSentQueue() {
 
   let sent = [];
   try {
-    const res = await graph('/me/mailFolders/sentitems/messages?$top=25&$orderby=sentDateTime desc&$select=id,subject,toRecipients,sentDateTime,internetMessageId');
+    const res = await graph('/me/mailFolders/sentitems/messages?$top=50&$orderby=sentDateTime desc&$select=id,subject,toRecipients,sentDateTime,internetMessageId');
     sent = res.value || [];
     console.log('[cip] Sent Items fetched:', sent.length);
   } catch (e) {
@@ -892,27 +896,46 @@ async function drainSentQueue() {
 
   const filedSet = readFiledSet();
   const keepLocal = [], keepDrive = [];
+  const norm = s => (s || '').toString().toLowerCase().trim();
 
   for (const entry of entries) {
     const armedMs = new Date(entry.armedAt).getTime();
-    const candidates = sent.filter(m => {
-      if (filedSet.includes(m.internetMessageId)) return false;
-      const sentMs = new Date(m.sentDateTime).getTime();
-      if (sentMs < armedMs - 60000) return false;   // 1 min clock-skew tolerance
-      const toAddrs = (m.toRecipients || []).map(r =>
-        (r.emailAddress && r.emailAddress.address || '').toLowerCase());
-      return !entry.recipients || entry.recipients.length === 0 ||
-        entry.recipients.some(r => toAddrs.includes(r));
-    }).sort((a, b) => new Date(a.sentDateTime) - new Date(b.sentDateTime));
+    const entryRecips = (entry.recipients || []).map(norm).filter(Boolean);
+    const entrySubj = norm(entry.subject);
 
-    const match = candidates[0];
-    if (!match) {
-      console.log('[cip] no match yet for entry armed at', entry.armedAt, 'to', (entry.recipients || []).join(','));
+    // Candidate = any unfiled message sent at/after arm time (5 min skew tolerance).
+    // We deliberately do NOT require the recipient to match here - the To value
+    // captured at compose time can differ from the resolved SMTP address in Sent
+    // Items (alias, display name, distribution list). Recipient/subject are used
+    // only to SCORE candidates and pick the best one.
+    const candidates = sent
+      .filter(m => {
+        if (filedSet.includes(m.internetMessageId)) return false;
+        const sentMs = new Date(m.sentDateTime).getTime();
+        return sentMs >= armedMs - 300000;   // 5 min clock-skew tolerance
+      })
+      .map(m => {
+        let score = 0;
+        const toAddrs = (m.toRecipients || []).map(r =>
+          norm(r.emailAddress && r.emailAddress.address));
+        const toNames = (m.toRecipients || []).map(r =>
+          norm(r.emailAddress && r.emailAddress.name));
+        if (entryRecips.length && entryRecips.some(r => toAddrs.includes(r) || toNames.includes(r))) score += 2;
+        if (entrySubj && norm(m.subject) === entrySubj) score += 2;
+        else if (entrySubj && norm(m.subject).indexOf(entrySubj) !== -1) score += 1;
+        // Prefer the message sent soonest after arming (tie-breaker via timestamp).
+        return { m, score, sentMs: new Date(m.sentDateTime).getTime() };
+      })
+      .sort((a, b) => (b.score - a.score) || (a.sentMs - b.sentMs));
+
+    const best = candidates[0];
+    if (!best) {
+      console.log('[cip] no sent message yet after arm time for entry', entry.armedAt, 'to', entryRecips.join(','));
       (entry._source === 'onedrive' ? keepDrive : keepLocal).push(entry);
       continue;
     }
-
-    console.log('[cip] match found, filing:', match.subject);
+    const match = best.m;
+    console.log('[cip] match (score ' + best.score + '), filing:', match.subject);
     try {
       await fileQueuedMessage(match, entry);
       addToFiledSet(match.internetMessageId);
