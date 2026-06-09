@@ -796,16 +796,61 @@ function stageSendQueueEntry(settings) {
 }
 
 // Poll Sent Items and file any queued intents whose message has now been sent.
-async function drainSentQueue() {
-  let q = readSendQueue();
-  if (!q.length) return;
+// Path of the per-user OneDrive pending-filing queue (written by the dialog
+// flow in dialog.js). This is the bridge that lets dialog-armed sends reach
+// this poller across the isolated dialog storage context.
+const ONEDRIVE_PENDING_PATH = '/me/drive/root:/cip-file-email-pending.json';
 
+async function readOneDriveQueue() {
+  let res;
+  try {
+    res = await graph(ONEDRIVE_PENDING_PATH + ':/content');
+  } catch (e) {
+    if (/404/.test(e && e.message || '')) return [];   // no queue file yet
+    throw e;
+  }
+  if (Array.isArray(res)) return res;                  // graph() already parsed JSON
+  let data;
+  if (res && typeof res.text === 'function') data = await res.text();
+  else if (typeof res === 'string') data = res;
+  else return [];
+  try { const arr = JSON.parse(data); return Array.isArray(arr) ? arr : []; }
+  catch (e) { return []; }
+}
+
+async function writeOneDriveQueue(arr) {
+  await graph(ONEDRIVE_PENDING_PATH + ':/content', {
+    method: 'PUT',
+    contentType: 'application/json',
+    body: JSON.stringify(arr || [])
+  });
+}
+
+function stripSource(e) { const c = Object.assign({}, e); delete c._source; return c; }
+
+// Drain BOTH queues: the localStorage queue (compose-taskpane flow) and the
+// OneDrive queue (dialog flow). Match each pending entry to a sent message and
+// file it, then write back whatever didn't match yet.
+async function drainSentQueue() {
   const now = Date.now();
   const MAX_AGE_MS = 24 * 60 * 60 * 1000;   // expire after 24h
-  const MAX_ATTEMPTS = 8;                    // stop retrying a stubborn entry
+  const MAX_ATTEMPTS = 8;
+  const fresh = e => (now - new Date(e.armedAt).getTime()) < MAX_AGE_MS && (e.attempts || 0) < MAX_ATTEMPTS;
 
-  q = q.filter(e => (now - new Date(e.armedAt).getTime()) < MAX_AGE_MS && (e.attempts || 0) < MAX_ATTEMPTS);
-  if (!q.length) { writeSendQueue(q); return; }
+  const localQ = readSendQueue().filter(fresh);
+
+  let driveQ = [], driveReadOk = false;
+  try { driveQ = (await readOneDriveQueue()).filter(fresh); driveReadOk = true; }
+  catch (e) { console.warn('Could not read OneDrive pending queue:', e && e.message); }
+
+  const entries = localQ.map(e => { e._source = 'local'; return e; })
+    .concat(driveQ.map(e => { e._source = 'onedrive'; return e; }));
+
+  if (!entries.length) {
+    writeSendQueue(localQ.map(stripSource));
+    if (driveReadOk) { try { await writeOneDriveQueue(driveQ.map(stripSource)); } catch (e) {} }
+    return;
+  }
 
   let sent = [];
   try {
@@ -813,14 +858,13 @@ async function drainSentQueue() {
     sent = res.value || [];
   } catch (e) {
     console.warn('Sent Items poll failed:', e && e.message);
-    writeSendQueue(q);   // persist expiry cleanup
-    return;
+    return;   // leave both queues untouched; retry next time the taskpane opens
   }
 
   const filedSet = readFiledSet();
-  const remaining = [];
+  const keepLocal = [], keepDrive = [];
 
-  for (const entry of q) {
+  for (const entry of entries) {
     const armedMs = new Date(entry.armedAt).getTime();
     const candidates = sent.filter(m => {
       if (filedSet.includes(m.internetMessageId)) return false;
@@ -828,23 +872,29 @@ async function drainSentQueue() {
       if (sentMs < armedMs - 60000) return false;   // 1 min clock-skew tolerance
       const toAddrs = (m.toRecipients || []).map(r =>
         (r.emailAddress && r.emailAddress.address || '').toLowerCase());
-      return entry.recipients.length === 0 || entry.recipients.some(r => toAddrs.includes(r));
+      return !entry.recipients || entry.recipients.length === 0 ||
+        entry.recipients.some(r => toAddrs.includes(r));
     }).sort((a, b) => new Date(a.sentDateTime) - new Date(b.sentDateTime));
 
     const match = candidates[0];
-    if (!match) { remaining.push(entry); continue; }   // not sent yet - keep waiting
+    if (!match) {
+      (entry._source === 'onedrive' ? keepDrive : keepLocal).push(entry);
+      continue;
+    }
 
     try {
       await fileQueuedMessage(match, entry);
       addToFiledSet(match.internetMessageId);
-      // success - entry consumed, do not re-add
+      // filed - entry consumed
     } catch (e) {
       console.warn('Auto-file of sent message failed (will retry):', e && e.message);
       entry.attempts = (entry.attempts || 0) + 1;
-      remaining.push(entry);
+      (entry._source === 'onedrive' ? keepDrive : keepLocal).push(entry);
     }
   }
-  writeSendQueue(remaining);
+
+  writeSendQueue(keepLocal.map(stripSource));
+  if (driveReadOk) { try { await writeOneDriveQueue(keepDrive.map(stripSource)); } catch (e) {} }
 }
 
 // Upload one sent message to its queued destination. Reuses the existing

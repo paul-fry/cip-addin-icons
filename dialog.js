@@ -24,11 +24,38 @@ let allLibraries = [];
 let selectedSite = null;
 let selectedLib = null;
 
+// Context handed to us by commands.js (the outgoing message's recipients +
+// subject), needed to write a matchable pending-filing record.
+let dialogContext = { recipients: [], subject: '' };
+
+// Path of the per-user pending-filing queue in OneDrive. Both this dialog and
+// the taskpane poller read/write this single JSON file via Graph - it's the
+// bridge that survives the send and crosses the isolated dialog context.
+const PENDING_PATH = '/me/drive/root:/cip-file-email-pending.json';
+
 Office.onReady(() => {
+  // Receive the context (recipients/subject) that commands.js sends in response
+  // to our "ready" handshake below.
+  try {
+    Office.context.ui.addHandlerAsync(Office.EventType.DialogParentMessageReceived, (arg) => {
+      try {
+        const m = JSON.parse(arg.message || '{}');
+        if (m.type === 'context') {
+          dialogContext.recipients = Array.isArray(m.recipients) ? m.recipients : [];
+          dialogContext.subject = m.subject || '';
+        }
+      } catch (e) { /* ignore malformed parent messages */ }
+    });
+  } catch (e) { /* older hosts may not support parent messaging - matching falls back to time only */ }
+
   init().catch(e => {
     console.error('Dialog init failed:', e);
     showBanner('Could not initialise: ' + e.message, 'error');
   });
+
+  // Announce readiness so commands.js sends us the context.
+  try { Office.context.ui.messageParent(JSON.stringify({ type: 'ready' })); }
+  catch (e) { /* parent will still work; we just may lack recipients */ }
 });
 
 async function init() {
@@ -120,16 +147,53 @@ async function getToken() {
   return r.accessToken;
 }
 
-async function graph(path) {
+async function graph(path, opts) {
+  opts = opts || {};
   const url = path.startsWith('http') ? path : 'https://graph.microsoft.com/v1.0' + path;
+  const headers = { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' };
+  if (opts.body) headers['Content-Type'] = opts.contentType || 'application/json';
   const res = await fetch(url, {
-    headers: { 'Authorization': 'Bearer ' + accessToken, 'Accept': 'application/json' }
+    method: opts.method || 'GET',
+    headers: headers,
+    body: opts.body
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error('Graph ' + res.status + (text ? ': ' + text.slice(0, 160) : ''));
+    const err = new Error('Graph ' + res.status + (text ? ': ' + text.slice(0, 160) : ''));
+    err.status = res.status;
+    throw err;
   }
-  return res.json();
+  if (opts.raw) return res;                 // caller wants the raw Response (e.g. file content)
+  if (res.status === 204) return null;      // No Content (e.g. DELETE)
+  const ct = res.headers.get('content-type') || '';
+  return ct.indexOf('application/json') !== -1 ? res.json() : res.text();
+}
+
+// Read the OneDrive pending-filing queue (array). Returns [] if the file
+// doesn't exist yet.
+async function readPendingQueue() {
+  try {
+    const res = await graph(PENDING_PATH + ':/content', { raw: true });
+    const txt = await res.text();
+    const arr = JSON.parse(txt);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    if (e && e.status === 404) return [];   // no queue file yet - that's fine
+    throw e;
+  }
+}
+
+// Append one record to the OneDrive pending-filing queue and write it back.
+async function appendPendingRecord(record) {
+  let queue = [];
+  try { queue = await readPendingQueue(); }
+  catch (e) { console.warn('Could not read pending queue (will start fresh):', e && e.message); queue = []; }
+  queue.push(record);
+  await graph(PENDING_PATH + ':/content', {
+    method: 'PUT',
+    body: JSON.stringify(queue),
+    contentType: 'application/json'
+  });
 }
 
 // ============================================================
@@ -278,33 +342,62 @@ function escapeHtml(s) {
 }
 
 // ============================================================
-// Send the user's choice back to commands.js via messageParent
+// Send the user's choice back to commands.js via messageParent.
+// For "file", first write a pending-filing record to OneDrive (the bridge the
+// taskpane poller reads), then report success/failure back to commands.js.
 // ============================================================
-function onAction(action) {
-  let payload;
-  if (action === 'file') {
-    if (!selectedSite || !selectedLib) {
-      showBanner('Pick a site and library first.', 'warn');
-      return;
-    }
-    payload = {
-      action: 'file',
+async function onAction(action) {
+  if (action !== 'file') {
+    // skip / cancel - just tell commands.js; nothing to write.
+    sendToParent({ type: 'action', action: action });
+    return;
+  }
+
+  if (!selectedSite || !selectedLib) {
+    showBanner('Pick a site and library first.', 'warn');
+    return;
+  }
+
+  const btn = document.getElementById('btn-file');
+  btn.disabled = true;
+  btn.textContent = 'Filing…';
+
+  const record = {
+    id: 'p_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+    armedAt: new Date().toISOString(),
+    recipients: dialogContext.recipients || [],
+    subject: dialogContext.subject || '',
+    dest: {
       siteId:   selectedSite.id,
       siteName: selectedSite.displayName || selectedSite.name,
       libId:    selectedLib.id,
       libName:  selectedLib.name,
-      folder:   document.getElementById('f-folder').value.trim(),
+      folder:   document.getElementById('f-folder').value.trim()
+    },
+    tags: {
       client:   document.getElementById('f-client').value.trim(),
       project:  document.getElementById('f-project').value.trim(),
       category: document.getElementById('f-category').value,
       notes:    document.getElementById('f-notes').value.trim()
-    };
-  } else {
-    payload = { action };
-  }
+    },
+    source: 'dialog'
+  };
+
+  let written = false;
   try {
-    Office.context.ui.messageParent(JSON.stringify(payload));
+    await appendPendingRecord(record);
+    written = true;
   } catch (e) {
-    console.error('messageParent failed:', e);
+    console.error('Could not write pending-filing record to OneDrive:', e && e.message);
+    written = false;
   }
+
+  // Report back. commands.js allows the send either way - if the write failed,
+  // it logs a warning and the user can file manually from the sent copy.
+  sendToParent({ type: 'action', action: 'file', written: written });
+}
+
+function sendToParent(obj) {
+  try { Office.context.ui.messageParent(JSON.stringify(obj)); }
+  catch (e) { console.error('messageParent failed:', e); }
 }
